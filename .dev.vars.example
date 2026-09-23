@@ -1,0 +1,6 @@
+SITE_ORIGIN="https://me.nouhlab.com"
+TURNSTILE_SITE_KEY=""
+TURNSTILE_SECRET_KEY=""
+GROQ_API_KEY=""
+RESEND_API_KEY=""
+LEAD_FROM="Ahmad Nouh Portfolio <portfolio@me.nouhlab.com>"

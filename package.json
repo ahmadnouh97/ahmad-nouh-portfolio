@@ -1,0 +1,20 @@
+{
+  "name": "ahmad-nouh-portfolio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "dev": "node scripts/render.ts && vite --host 127.0.0.1",
+    "build": "node scripts/render.ts && tsc --noEmit && vite build",
+    "preview": "wrangler pages dev dist --ip 127.0.0.1 --port 8788",
+    "check": "node --test checks/site.test.ts",
+    "deploy": "npm run build && wrangler pages deploy dist --project-name ahmad-nouh-portfolio --branch main"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0",
+    "wrangler": "^4.0.0"
+  }
+}

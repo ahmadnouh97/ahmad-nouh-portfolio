@@ -10,6 +10,8 @@ index.html
 work/
 privacy/
 qa/
+# Resume deliverables may contain private contact details.
+output/pdf/
 # Local review evidence and the CV helper depend on the private workspace.
 /VERIFICATION.md
 /scripts/public-cv.py

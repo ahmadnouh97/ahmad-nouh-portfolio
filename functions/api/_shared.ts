@@ -51,6 +51,11 @@ export async function body(request: Request, env: Env): Promise<Record<string, u
 export async function verifyTurnstile(token: unknown, action: 'chat' | 'lead', env: Env) {
   const response = field(token, 'security check', 2048);
   if (!env.TURNSTILE_SECRET_KEY) throw new HttpError(503, 'This form is not connected yet. Please email Ahmad.');
+  const testing = env.TURNSTILE_SECRET_KEY === '1x0000000000000000000000000000000AA';
+  // Cloudflare dummy tokens omit the action and return an example hostname.
+  // Accept them only with the matching dummy site key on an HTTP loopback preview.
+  const origin = new URL(env.SITE_ORIGIN);
+  if (testing && (origin.protocol !== 'http:' || !['localhost', '127.0.0.1'].includes(origin.hostname) || env.TURNSTILE_SITE_KEY !== '1x00000000000000000000AA')) throw new HttpError(503, 'Test security keys are only supported in the local preview.');
   const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ secret: env.TURNSTILE_SECRET_KEY, response }),
@@ -58,5 +63,5 @@ export async function verifyTurnstile(token: unknown, action: 'chat' | 'lead', e
   });
   if (!result.ok) throw new HttpError(503, 'The security check is unavailable. Please try again.');
   const data = await result.json() as { success?: boolean; hostname?: string; action?: string };
-  if (!data.success || data.hostname !== new URL(env.SITE_ORIGIN).hostname || data.action !== action) throw new HttpError(403, 'The security check expired or failed. Please try again.');
+  if (!data.success || (!testing && (data.hostname !== origin.hostname || data.action !== action))) throw new HttpError(403, 'The security check expired or failed. Please try again.');
 }

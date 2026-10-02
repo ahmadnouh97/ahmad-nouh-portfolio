@@ -36,18 +36,21 @@ This uses GitHub-hosted Linux runners and the existing Cloudflare Pages project;
 
 ## Source
 
-- `src/content.ts`: reviewed, approved public facts shared by the static pages and Twin.
+- `src/content.ts`: public facts curated from the October 2, 2026 resume knowledge base, shared by the static pages and Twin. The private master document stays outside this repository.
 - `scripts/render.ts`: homepage, four case studies, and privacy page.
-- `src/style.css`: mineral/teal themes, responsive work panels, scroll reveals, and native CSS motion.
+- `src/style.css`: mineral/teal themes, inline experience, attributed results, contextual toolkit, responsive layouts, and native CSS motion.
 - `src/main.ts`: saved theme/motion preferences, animated native chat dialog, streamed responses, stop/retry states, and contact form.
 - `src/stream.ts`: shared SSE decoder; handles fragmented UTF-8 and CRLF.
+- `src/chat-limits.ts`: shared answer/history limits and complete-turn pruning, including UTF-8 request size.
+- `src/chat-format.ts`: safe text formatting for the Twin's headings and bullets; no generated HTML is executed.
+- `src/chat-knowledge.ts`: approved answer passages, constrained selection schema, and server-side answer assembly.
 - `functions/api/`: public configuration, chat relay, lead notification, validation, and Turnstile verification.
 - `public/ahmad-nouh-public-cv.pdf`: reviewed public CV without a phone number.
 - `checks/site.test.ts`: Node's built-in checks for content boundaries, SSE, request validation, provider errors, and lead behavior.
 
-The initial theme follows the device. The sun/moon switch saves a manual choice; the footer restores device theme. Motion respects reduced-motion preferences unless the visitor explicitly enables it, and can be paused.
+The initial theme follows the device. The sun/moon switch saves a manual choice; the footer restores device theme. Motion starts enabled unless the device requests reduced motion. Visitors can explicitly enable it or pause it for the current visit; a saved pause does not disable future visits.
 
-The Twin sends a short conversation and approved public facts to Groq. Only answer text is streamed; output is bounded, interrupted answers are marked, and only completed answers enter subsequent context. Chat history stays in page memory; the site does not store transcripts on a server.
+The four shared recruiter prompts return coherent, reviewed answers directly after Turnstile verification, without an inference request. The same answer passages are available to the selector for equivalent broad questions. For other questions, the Twin uses Groq with a compact preview catalog to select relevant approved passages from `src/chat-knowledge.ts`, derived from the same public content as the pages. A strict JSON schema permits only passage IDs and an unanswered flag. The server validates the complete selection and renders the approved text with its qualifications and source links; model-authored prose never reaches visitors. Unknown IDs, extra fields, malformed output, or incomplete provider responses fail closed in both JSON and SSE responses. Answers are currently in English, even when the question is in another language. Selection can still miss relevant passages; this is an evidence selection assistant, not unrestricted generation. Responses allow 1,200 completion tokens for selection, up to six passages, and 8,000 rendered characters without clipping qualifications. Stop requests cancel inference; only validated answers enter history. History retains complete recent turns within character and UTF-8 request limits and stays in page memory; no server transcript storage.
 
 ## Service secrets
 
@@ -62,7 +65,7 @@ The file is ignored. Never prefix a secret with `VITE_`.
 
 Production `SITE_ORIGIN` and `LEAD_FROM` are configured in `wrangler.toml`. Resend's sending domain must be verified; Turnstile must allow the exact production hostname. Both APIs check the request hostname, Origin, Turnstile hostname/action, and input limits. Emails are sent only after explicit form submission, to a fixed recipient with the visitor's address as reply-to.
 
-For local form testing, separately allow `localhost` in Turnstile, use `http://localhost:8788`, and set the local `.dev.vars` `SITE_ORIGIN` to that exact origin. Production hostname validation is never bypassed.
+For local form testing, use `http://localhost:8788` and set `.dev.vars` `SITE_ORIGIN` to that exact origin. Use Cloudflare’s documented dummy site key `1x00000000000000000000AA` and secret `1x0000000000000000000000000000000AA`. Dummy verification is restricted to HTTP loopback previews and still requires a successful Siteverify response. Real keys retain hostname/action validation; dummy keys are rejected on production origins and by the secret-upload helper. See [Cloudflare testing](https://developers.cloudflare.com/turnstile/troubleshooting/testing/).
 
 To update production service bindings after a local Wrangler sign-in:
 
@@ -80,3 +83,7 @@ Only the standalone portfolio source, public assets, and CI configuration belong
 Public copy preserves the distinction between Blink's delivered recommendations and beta agent, MENT's measured pipeline improvements and separate graph/agent contributions, and Lableb's model research and production spam service. No employer screenshots or internal diagrams are included.
 
 Fonts are self-hosted; their OFL licenses are included under `public/fonts/`.
+
+Project screenshots under `public/projects/` are actual captures from the personal project repositories. The Second Memory video and captures use synthetic sample notes. Topic Classification captures show its Streamlit workflow and are not presented as a new benchmark. No employer systems are pictured.
+
+Homepage project previews use CSS monochrome tinting in frames that follow the selected theme. Original-color screenshots and recordings remain available through the image links and demo disclosures.

@@ -14,6 +14,8 @@ export const recruiterPrompts = [
 // The model selects passages, never writes visitor-facing career claims.
 // Keep qualifications with their claims; both come from the pages' public facts.
 export const chatPassages = [
+  passage('conversation-greeting', 'Greeting', 'Hello! Ask me about Ahmad’s professional experience, technical skills, projects, or results. What would you like to know?'),
+  passage('conversation-thanks', 'Thanks', 'You’re welcome! Feel free to ask a follow-up about Ahmad’s work, or share a job description to explore how his experience relates to the role.'),
   passage('recruiter-experience', 'Recruiter answer · Professional experience', `Ahmad is an AI Engineer with approximately six years of professional AI engineering experience through July 2026. His career spans Arabic NLP, LLM applications, recommendations, and the Python services that bring AI features into products.
 
 ### Blink · Nov 2025–Jul 2026
@@ -112,9 +114,17 @@ export const selectionFormat = {
   },
 };
 
+const normalizeQuestion = (text: string) => text.trim().toLowerCase().replace(/’/g, "'").replace(/[.!?]+$/, '').trim();
+
+export function conversationSelection(question: string) {
+  const text = normalizeQuestion(question);
+  const id = /^(?:(?:hi|hello|hey)(?: there)?|good (?:morning|afternoon|evening))$/.test(text) ? 'conversation-greeting'
+    : /^(?:thanks(?: a lot)?|thank you(?: so much)?)$/.test(text) ? 'conversation-thanks' : undefined;
+  return id ? { ids: [id], unanswered: false } : undefined;
+}
+
 export function recruiterSelection(question: string) {
-  const normalize = (text: string) => text.trim().toLowerCase().replace(/’/g, "'").replace(/[.!?]+$/, '');
-  const prompt = recruiterPrompts.find(([, text]) => normalize(text) === normalize(question));
+  const prompt = recruiterPrompts.find(([, text]) => normalizeQuestion(text) === normalizeQuestion(question));
   return prompt ? { ids: [prompt[2]], unanswered: false } : undefined;
 }
 
@@ -130,7 +140,7 @@ export function groundedAnswer(selection: unknown, firstTurn: boolean): string {
   const parts = firstTurn ? ['I’m Ahmad’s AI assistant.'] : [];
   if (!selected.length) parts.push(`I don’t have documented information that answers that question. Please ask Ahmad directly at ${profile.email}.`);
   else {
-    for (const p of selected) parts.push(p.id.startsWith('recruiter-') ? p.text : `### ${p.title}\n\n${p.text}`);
+    for (const p of selected) parts.push(/^(recruiter|conversation)-/.test(p.id) ? p.text : `### ${p.title}\n\n${p.text}`);
     if (unanswered) parts.push(`The documented information above does not establish every detail you asked about. Ahmad can clarify at ${profile.email}.`);
     const sources = [...new Set(selected.map(p => p.source).filter(Boolean))];
     if (sources.length) parts.push(`### Explore the work\n\n${sources.map(s => `- ${s.startsWith('/') ? `https://me.nouhlab.com${s}` : s}`).join('\n')}`);

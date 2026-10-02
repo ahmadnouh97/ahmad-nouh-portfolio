@@ -1,5 +1,7 @@
 import './style.css';
 import { readEvents } from './stream.ts';
+import { chatRequest } from './chat-limits.ts';
+import { answerBlocks } from './chat-format.ts';
 
 const root = document.documentElement;
 const systemDark = matchMedia('(prefers-color-scheme: dark)');
@@ -34,7 +36,10 @@ function syncMotion() {
 }
 motionToggle.addEventListener('click', () => {
   root.dataset.motion = motionReduced() ? 'on' : 'paused';
-  try { localStorage.setItem('portfolio-motion', root.dataset.motion); } catch { /* Page preference still works. */ }
+  try {
+    if (root.dataset.motion === 'on') localStorage.setItem('portfolio-motion', 'on');
+    else localStorage.removeItem('portfolio-motion');
+  } catch { /* Page preference still works. */ }
   syncMotion();
 });
 reducedMotion.addEventListener('change', syncMotion);
@@ -161,7 +166,7 @@ function appendMessage(role: Message['role'], content: string) {
   log.querySelector('.chat-welcome')?.remove();
   const message = document.createElement('div'); message.className = `message ${role}`;
   const author = document.createElement('span'); author.className = 'message-author'; author.textContent = role === 'user' ? 'You' : 'Ahmad’s AI Twin';
-  const text = document.createElement('p'); text.textContent = content;
+  const text = document.createElement('div'); text.className = 'message-content'; text.textContent = content;
   message.append(author, text); log.append(message); log.scrollTop = log.scrollHeight;
   return { message, text };
 }
@@ -194,11 +199,11 @@ chatForm.addEventListener('submit', async event => {
     chatStatus.textContent = 'Checking your connection…';
     const token = await securityToken('chat', settings.siteKey, signal);
     signal.throwIfAborted();
-    chatStatus.textContent = 'The Twin is thinking…';
+    chatStatus.textContent = 'Preparing your answer…';
     // ponytail: page-memory history only; the last two completed turns keep requests small.
-    const history = [...messages.slice(-4), { role: 'user' as const, content: question }];
-    while (history.reduce((length, message) => length + message.content.length, 0) > 6500) history.splice(0, 2);
-    const response = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: history, token, stream: true }), signal: AbortSignal.any([signal, AbortSignal.timeout(40000)]) });
+    const payload = chatRequest(messages, question, token);
+    const history = payload.messages;
+    const response = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.any([signal, AbortSignal.timeout(60000)]) });
     if (!response.ok) {
       const result = await response.json() as { error?: string };
       throw new Error(result.error || 'The Twin is temporarily unavailable. Please try again.');
@@ -213,10 +218,31 @@ chatForm.addEventListener('submit', async event => {
       }
       if (!done || !answer) throw new Error('The response was interrupted. Please try again.');
     } else {
-      const result = await response.json() as { answer?: string };
+      const result = await response.json() as { answer?: string; truncated?: boolean };
       if (!result.answer) throw new Error('The Twin could not complete an answer. Please try again.');
-      showToken(result.answer); done = true;
+      showToken(result.answer); done = true; truncated = result.truncated === true;
     }
+    reply.text.replaceChildren(...answerBlocks(answer).map(block => {
+      const element = document.createElement(block.kind === 'heading' ? 'h4' : block.kind === 'list' ? 'ul' : block.kind === 'table' ? 'div' : 'p');
+      if (block.kind === 'table') {
+        element.className = 'chat-table'; element.tabIndex = 0; element.setAttribute('role', 'region'); element.setAttribute('aria-label', 'Response comparison');
+        const table = document.createElement('table');
+        block.lines.forEach((line, index) => {
+          const row = document.createElement('tr');
+          line.trim().split('|').slice(1, -1).forEach(value => { const cell = document.createElement(index === 0 ? 'th' : 'td'); if (index === 0) cell.setAttribute('scope', 'col'); cell.textContent = value.trim(); row.append(cell); });
+          table.append(row);
+        });
+        element.append(table);
+      } else if (block.kind === 'list') element.append(...block.lines.map(line => {
+        const item = document.createElement('li'); item.textContent = line;
+        if (/^https:\/\/[^\s]+$/.test(line)) {
+          const link = document.createElement('a'); link.href = line; link.textContent = line; link.target = '_blank'; link.rel = 'noopener noreferrer'; item.replaceChildren(link);
+        }
+        return item;
+      }));
+      else element.textContent = block.lines[0];
+      return element;
+    }));
     if (!truncated) messages = [...history, { role: 'assistant', content: answer }];
     chatStatus.textContent = truncated ? 'Response limit reached. Ask a more specific follow-up for more detail.' : '';
     announcement.textContent = `AI Twin: ${answer}`;

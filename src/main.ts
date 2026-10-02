@@ -199,7 +199,7 @@ chatForm.addEventListener('submit', async event => {
     chatStatus.textContent = 'Checking your connection…';
     const token = await securityToken('chat', settings.siteKey, signal);
     signal.throwIfAborted();
-    chatStatus.textContent = 'Finding documented details…';
+    chatStatus.textContent = 'Preparing your answer…';
     // ponytail: page-memory history only; the last two completed turns keep requests small.
     const payload = chatRequest(messages, question, token);
     const history = payload.messages;

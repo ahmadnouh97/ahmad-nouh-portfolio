@@ -29,10 +29,9 @@ test('dynamic replies answer the specific question and pass review before delive
     if (ratePrimary && payload.model === 'openai/gpt-oss-120b') return new Response('limit', { status: 429 });
     if (payload.model === 'openai/gpt-oss-20b') fallbackCalls++;
     const stage = payload.response_format.json_schema?.name;
-    if (stage === 'portfolio_review') assert.equal(payload.model, 'qwen/qwen3.8-27b');
+    if (stage === 'portfolio_review') assert.equal(payload.model, ratePrimary ? 'openai/gpt-oss-20b' : 'openai/gpt-oss-120b');
     if (stage !== 'portfolio_review' && stage !== 'portfolio_evidence') {
       assert.equal(payload.response_format.type, 'json_object', 'Free-form answers avoid strict-schema provider clipping');
-      if (payload.model.startsWith('qwen/')) assert.ok(payload.max_completion_tokens <= 800, 'Fallback fits the provider output allowance');
     }
     const content = stage === 'portfolio_evidence' ? { ids: ['experience'] } : stage === 'portfolio_review' ? { issues: [], valid: true }
       : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026, preceded by web development.', ids: ['experience'] };
@@ -50,8 +49,168 @@ test('dynamic replies answer the specific question and pass review before delive
     const fallback = await chat({ request: request({ ...conversation, messages: [{ role: 'user', content: 'How many years of experience does Ahmad have?' }] }), env });
     assert.equal(fallback.status, 200);
     assert.equal((await fallback.json() as any).answer, answer);
-    assert.equal(fallbackCalls, 1, 'Retrieval uses the small fallback; writing and review use Qwen');
+    assert.equal(fallbackCalls, 3, 'The production fallback handles retrieval, writing, and review');
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test('each inference stage uses only production models and falls back after a rate limit', async () => {
+  const originalFetch = globalThis.fetch;
+  const chains = [
+    ['portfolio_evidence', ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']],
+    ['writer', ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']],
+    ['portfolio_review', ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']],
+  ] as const;
+  try {
+    for (const [limitedStage, expectedModels] of chains) {
+      const tried: string[] = [];
+      let reviewed = false;
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name ?? 'writer';
+        assert.ok(['openai/gpt-oss-120b', 'openai/gpt-oss-20b'].includes(payload.model), 'Preview models are never called');
+        if (stage === 'writer') assert.equal(payload.response_format.type, 'json_object');
+        else assert.equal(payload.response_format.json_schema.strict, true);
+        assert.equal(payload.reasoning_effort, stage === 'portfolio_review' ? 'medium' : 'low');
+        if (stage === limitedStage) {
+          tried.push(payload.model);
+          if (tried.length === 1) return new Response('rate limited', { status: 429 });
+        }
+        if (stage === 'portfolio_review') reviewed = true;
+        const content = stage === 'portfolio_evidence' ? { ids: ['experience'] } : stage === 'portfolio_review' ? { issues: [], valid: true }
+          : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      };
+      const result = await chat({ request: request(conversation), env });
+      assert.equal(result.status, 200, limitedStage);
+      assert.match((await result.json() as any).answer, /approximately six years/);
+      assert.deepEqual(tried, expectedModels);
+      assert.equal(reviewed, true, 'Using a fallback never skips factual review');
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('production reviewers have room for hidden reasoning before a complete JSON decision', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const fallback of [false, true]) {
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+        if (stage === 'portfolio_review') {
+          if (fallback && payload.model === 'openai/gpt-oss-120b') return new Response('rate limited', { status: 429 });
+          // Live career review required 1,383 completion tokens, including hidden reasoning.
+          if (payload.max_completion_tokens < 1383) return Response.json({ error: { code: 'json_validate_failed' } }, { status: 400 });
+          return Response.json({ choices: [{ message: { content: '{"issues":[],"valid":true}' }, finish_reason: 'stop' }] });
+        }
+        const content = stage === 'portfolio_evidence' ? { ids: ['experience'] }
+          : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      };
+      const result = await chat({ request: request(conversation), env });
+      assert.equal(result.status, 200, 'A review must have enough tokens to finish rather than returning a provider JSON failure');
+      assert.match((await result.json() as any).answer, /approximately six years/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('model fallbacks are bounded and stop for permanent failures or cancellation', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const scenario of ['all-limited', 'auth-error', 'cancelled']) {
+      const cancellation = new AbortController(), tried: string[] = [];
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const payload = JSON.parse(init?.body as string);
+        tried.push(payload.model);
+        if (scenario === 'cancelled') cancellation.abort();
+        return new Response('SECRET_PROVIDER_BODY', { status: scenario === 'auth-error' ? 401 : 429 });
+      };
+      const result = await chat({ request: new Request(request(conversation), { signal: cancellation.signal }), env });
+      assert.equal(result.status, scenario === 'all-limited' ? 429 : 503);
+      assert.doesNotMatch(await result.text(), /SECRET_PROVIDER_BODY/);
+      assert.deepEqual(tried, scenario === 'all-limited' ? ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'] : ['openai/gpt-oss-120b']);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('malformed writer outputs get one correction and factual review before delivery', async () => {
+  const originalFetch = globalThis.fetch;
+  const good = { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+  try {
+    for (const scenario of ['wrong-field', 'array', 'unknown-id', 'outside-context', 'too-many-ids', 'invalid-json', 'incomplete', 'provider-json']) {
+      for (const stream of [false, true]) {
+        let writes = 0, reviews = 0;
+        globalThis.fetch = async (url, init) => {
+          if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+          const payload = JSON.parse(init?.body as string);
+          const stage = payload.response_format.json_schema?.name;
+          if (stage === 'portfolio_evidence') return Response.json({ choices: [{ message: { content: JSON.stringify({ ids: ['experience'] }) }, finish_reason: 'stop' }] });
+          if (stage === 'portfolio_review') {
+            reviews++;
+            assert.deepEqual(JSON.parse(payload.messages[1].content).draft, good);
+            return Response.json({ choices: [{ message: { content: '{"issues":[],"valid":true}' }, finish_reason: 'stop' }] });
+          }
+          writes++;
+          if (writes > 1) {
+            assert.match(payload.messages[0].content, /previous.*(?:invalid|failed)/i);
+            return Response.json({ choices: [{ message: { content: JSON.stringify(good) }, finish_reason: 'stop' }] });
+          }
+          if (scenario === 'provider-json') return Response.json({ error: { code: 'json_validate_failed', message: 'private provider detail' } }, { status: 400 });
+          const bad = scenario === 'wrong-field' ? { answer: 'UNREVIEWED', evidence_ids: ['experience'] }
+            : scenario === 'array' ? [good]
+            : { answer: 'UNREVIEWED', ids: scenario === 'unknown-id' ? ['invented'] : scenario === 'outside-context' ? ['ment-0'] : scenario === 'too-many-ids' ? Array(7).fill('experience') : ['experience'] };
+          return Response.json({ choices: [{ message: { content: scenario === 'invalid-json' ? '{' : JSON.stringify(bad) }, finish_reason: scenario === 'incomplete' ? 'length' : 'stop' }] });
+        };
+        const response = await chat({ request: request({ ...conversation, messages: [{ role: 'user', content: 'Tell me about Ahmad’s professional experience.' }], stream }), env });
+        assert.equal(response.status, 200, scenario);
+        const delivered = await response.text();
+        assert.match(delivered, /approximately six years/);
+        assert.doesNotMatch(delivered, /UNREVIEWED|evidence_ids|private provider detail/);
+        assert.equal(writes, 2, 'Correction is bounded to one additional draft');
+        assert.equal(reviews, 1, 'Only the corrected valid draft reaches factual review');
+      }
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('exhausted corrections fail closed and diagnostics omit conversations and credentials', async () => {
+  const originalFetch = globalThis.fetch, originalWarn = console.warn, originalInfo = console.info;
+  const logs: string[] = [];
+  console.warn = console.info = (...values: unknown[]) => { logs.push(values.join(' ')); };
+  try {
+    for (const scenario of ['invalid-draft', 'rejected-review', 'provider-json', 'provider-auth', 'provider-server', 'timeout', 'cancelled']) {
+      logs.length = 0;
+      let writes = 0, reviews = 0;
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+        if (stage === 'portfolio_evidence') return Response.json({ choices: [{ message: { content: '{"ids":["experience"]}' }, finish_reason: 'stop' }] });
+        if (stage === 'portfolio_review') {
+          reviews++;
+          return Response.json({ choices: [{ message: { content: '{"issues":["UNSUPPORTED_PRIVATE_DETAIL"],"valid":false}' }, finish_reason: 'stop' }] });
+        }
+        writes++;
+        if (scenario === 'provider-auth' || scenario === 'provider-server' || scenario === 'provider-json') return Response.json({ error: { code: scenario === 'provider-json' ? 'json_validate_failed' : 'permanent_failure', message: 'SECRET_PROVIDER_BODY' } }, { status: scenario === 'provider-auth' ? 401 : scenario === 'provider-server' ? 500 : 400 });
+        if (scenario === 'timeout' || scenario === 'cancelled') throw new DOMException('SECRET_NETWORK_DETAIL', scenario === 'timeout' ? 'TimeoutError' : 'AbortError');
+        const content = writes === 2 && scenario === 'rejected-review' ? { answer: 'UNSUPPORTED_PRIVATE_DETAIL', ids: ['experience'] } : { answer: 'UNREVIEWED', evidence_ids: ['experience'] };
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      };
+      const response = await chat({ request: request({ ...conversation, messages: [{ role: 'user', content: 'PRIVATE_VISITOR_QUESTION' }], stream: true }), env });
+      assert.equal(response.status, 503, scenario);
+      const error = await response.text();
+      assert.doesNotMatch(error, /UNREVIEWED|UNSUPPORTED|SECRET_|temporarily unavailable\. Please email Ahmad/);
+      assert.equal(writes, ['invalid-draft', 'rejected-review', 'provider-json'].includes(scenario) ? 2 : 1);
+      assert.equal(reviews, scenario === 'rejected-review' ? 1 : 0);
+      assert.ok(logs.length > 0, 'Caught failures leave diagnostic metadata');
+      assert.doesNotMatch(logs.join('\n'), /PRIVATE_VISITOR_QUESTION|UNREVIEWED|UNSUPPORTED|SECRET_|test-groq|test-secret|Bearer|messages|evidence_ids/);
+      for (const log of logs) {
+        const entry = JSON.parse(log);
+        assert.equal(entry.event, 'ai_twin');
+        assert.equal(typeof entry.category, 'string');
+        assert.equal(typeof entry.elapsedMs, 'number');
+      }
+    }
+  } finally { globalThis.fetch = originalFetch; console.warn = originalWarn; console.info = originalInfo; }
 });
 
 test('known unsupported or unfinished drafts are corrected even when model review approves', async () => {
@@ -227,6 +386,45 @@ test('draft validation preserves generated wording and evidence boundaries', () 
   assert.match(detailed, /https:\/\/me.nouhlab.com\/work\/blink\//);
   assert.equal(detailed.match(/https:\/\/me.nouhlab.com\/work\/blink\//g)?.length, 1);
   assert.equal(new Set(chatPassages.map(p => p.id)).size, chatPassages.length);
+});
+
+test('social wording and mixed professional questions use model evidence selection', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const [question, ids, answer] of [
+      ['hi', [], 'Hi! What would you like to know about Ahmad?'],
+      ['Good morning! How is everything going?', [], 'Good morning! Ready to help with questions about Ahmad.'],
+      ['Much appreciated 😊', [], 'Happy to help!'],
+      ['مرحبا كيف الحال؟', [], 'مرحباً! كيف يمكنني مساعدتك في معرفة المزيد عن أحمد؟'],
+      ['Hey! Tell me about Ahmad’s experience.', ['experience'], 'Ahmad has approximately six years of professional AI engineering experience through July 2026.'],
+    ] as const) {
+      let selections = 0, reviews = 0;
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+        let content: unknown;
+        if (stage === 'portfolio_evidence') {
+          selections++;
+          assert.equal(payload.messages.at(-1).content, question);
+          content = { ids };
+        } else if (stage === 'portfolio_review') {
+          reviews++;
+          assert.deepEqual(JSON.parse(payload.messages[1].content).draft, { answer, ids });
+          content = { issues: [], valid: true };
+        } else {
+          const evidence = JSON.parse(payload.messages[0].content.split('\nPublic evidence:\n')[1]);
+          assert.deepEqual(evidence.map((p: { id: string }) => p.id), [...ids, 'boundaries']);
+          content = { answer, ids };
+        }
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      };
+      const response = await chat({ request: request({ ...conversation, messages: [{ role: 'user', content: question }] }), env });
+      assert.equal(response.status, 200, question);
+      assert.equal((await response.json() as any).answer, answer);
+      assert.equal(selections, 1, 'Every phrasing reaches semantic evidence selection');
+      assert.equal(reviews, 1, 'Social replies still undergo review');
+    }
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test('greetings, recruiter prompts, and follow-ups use generation with verification', async () => {

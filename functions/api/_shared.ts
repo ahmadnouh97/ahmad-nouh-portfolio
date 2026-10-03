@@ -3,10 +3,11 @@ export interface Env {
   TURNSTILE_SITE_KEY?: string;
   TURNSTILE_SECRET_KEY?: string;
   GROQ_API_KEY?: string;
+  AI?: { run(model: string, input: Record<string, unknown>, options: { returnRawResponse: true; signal: AbortSignal }): Promise<Response> };
   RESEND_API_KEY?: string;
   LEAD_FROM?: string;
 }
-export interface Context { request: Request; env: Env }
+export interface Context { request: Request; env: Env; waitUntil?: (promise: Promise<unknown>) => void }
 export class HttpError extends Error {
   status: number;
   constructor(status: number, message: string) { super(message); this.status = status; }

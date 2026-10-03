@@ -12,10 +12,231 @@ import type { Env } from '../functions/api/_shared.ts';
 import { verifyTurnstile } from '../functions/api/_shared.ts';
 import { readEvents } from '../src/stream.ts';
 import { groundedAnswer, chatPassages, recruiterPrompts, validateDraft } from '../src/chat-knowledge.ts';
+import { retryAfterSeconds, retryMessage } from '../src/chat-retry.ts';
 
 const env: Env = { SITE_ORIGIN: 'https://me.nouhlab.com', GROQ_API_KEY: 'test-groq', RESEND_API_KEY: 'test-resend', TURNSTILE_SECRET_KEY: 'test-secret', TURNSTILE_SITE_KEY: 'test-public', LEAD_FROM: 'Portfolio <portfolio@me.nouhlab.com>' };
 const request = (data: unknown, origin = env.SITE_ORIGIN) => new Request(`${env.SITE_ORIGIN}/api/chat`, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
 const conversation = { messages: [{ role: 'user', content: 'What did Ahmad build at Blink?' }], token: 'valid' };
+
+test('retrieved employer contributions carry their own documented role and dates', () => {
+  for (const employer of cases) {
+    for (const [index] of employer.sections.entries()) {
+      const contribution = chatPassages.find(p => p.id === `${employer.slug}-${index}`)!;
+      assert.ok(contribution.text.includes(employer.role), contribution.id);
+      assert.ok(contribution.text.includes(employer.period), contribution.id);
+    }
+  }
+});
+
+test('Cloudflare production fallbacks retain structured retrieval, complete drafts, and factual review', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    {
+      const models: string[] = [], stages: string[] = [];
+      globalThis.fetch = async (url) => String(url).includes('siteverify')
+        ? Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' }) : new Response('limited', { status: 429 });
+      const aiEnv: Env = { ...env, AI: { async run(model, input, options) {
+        models.push(model);
+        assert.equal(options.returnRawResponse, true);
+        assert.ok(options.signal instanceof AbortSignal);
+        assert.equal(input.stream, false);
+        assert.equal(input.reasoning_format, undefined);
+        assert.equal(input.max_completion_tokens, undefined);
+        const format = input.response_format as { type: string; json_schema: { properties: Record<string, unknown>; required: string[] } };
+        assert.equal(format.type, 'json_schema', 'Cloudflare writing requests a native schema instead of unconstrained JSON-object mode');
+        const stage = 'answer' in format.json_schema.properties ? 'writer' : 'valid' in format.json_schema.properties ? 'review' : 'retrieval';
+        if (stage === 'writer') assert.deepEqual(format.json_schema.required, ['answer', 'ids']);
+        stages.push(stage);
+        assert.equal(input.max_tokens, stage === 'retrieval' ? 300 : stage === 'writer' ? 1800 : 1200);
+        const content = stage === 'retrieval' ? { ids: ['experience'] } : stage === 'review' ? { issues: [], valid: true }
+          : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      } } };
+      const response = await chat({ request: request(conversation), env: aiEnv });
+      assert.equal(response.status, 200);
+      assert.deepEqual(stages, ['retrieval', 'writer', 'review']);
+      assert.deepEqual(models, Array.from({ length: 3 }, () => '@cf/openai/gpt-oss-20b'));
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('Cloudflare quota exhaustion and permanent failures stop bounded fallback without publishing a draft', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const status of [429, 403, 500]) {
+      let calls = 0;
+      globalThis.fetch = async (url) => String(url).includes('siteverify')
+        ? Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' }) : new Response('limited', { status: 429 });
+      const response = await chat({ request: request({ ...conversation, stream: true }), env: { ...env, AI: { async run() {
+        calls++;
+        return new Response('PRIVATE_CF_ERROR', { status });
+      } } } });
+      assert.equal(calls, 1, 'Only the live-verified Cloudflare model is attempted');
+      assert.equal(response.status, status === 429 ? 429 : 503);
+      assert.doesNotMatch(await response.text(), /PRIVATE_CF_ERROR|event: token/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('Cloudflare malformed or rejected reviews fail closed and cancellation reaches the binding', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const failure of ['malformed', 'rejected', 'cancelled']) {
+      const controller = new AbortController();
+      let reviews = 0;
+      globalThis.fetch = async (url) => String(url).includes('siteverify')
+        ? Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' }) : new Response('limited', { status: 429 });
+      const response = await chat({ request: new Request(request({ ...conversation, stream: true }), { signal: controller.signal }), env: { ...env, AI: { async run(_model, input, options) {
+        if (failure === 'cancelled') {
+          controller.abort();
+          assert.equal(options.signal.aborted, true);
+          options.signal.throwIfAborted();
+        }
+        const schema = (input.response_format as any).json_schema;
+        let content: unknown;
+        if (schema?.properties.valid) { reviews++; content = failure === 'malformed' ? { valid: true } : { issues: ['Unsupported claim'], valid: false }; }
+        else content = schema?.properties.answer ? { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] } : { ids: ['experience'] };
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      } } } });
+      assert.equal(response.status, 503);
+      assert.equal(reviews, failure === 'cancelled' ? 0 : 2);
+      assert.doesNotMatch(await response.text(), /event: token|approximately six years/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('only reviewed standalone public suggestions are cached; security and conversation context still apply', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+  const stored = new Map<string, Response>();
+  let inference = 0, securityPass = true;
+  Object.defineProperty(globalThis, 'caches', { configurable: true, value: { default: {
+    async match(key: Request) { return stored.get(key.url)?.clone(); },
+    async put(key: Request, response: Response) { assert.equal(response.headers.get('Cache-Control'), 'public, max-age=600'); stored.set(key.url, response); },
+  } } });
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('siteverify')) return Response.json({ success: securityPass, hostname: 'me.nouhlab.com', action: 'chat' });
+    inference++;
+    const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+    const content = stage === 'portfolio_evidence' ? { ids: ['experience'] } : stage === 'portfolio_review' ? { issues: [], valid: true }
+      : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+    return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+  };
+  try {
+    const messages = [{ role: 'user', content: recruiterPrompts[0][1] }];
+    const first = await chat({ request: request({ messages, token: 'valid' }), env });
+    const answer = (await first.json() as any).answer;
+    assert.equal(stored.size, 1);
+    const second = await chat({ request: request({ messages, token: 'valid', stream: true }), env });
+    assert.match(await second.text(), /event: token/);
+    assert.equal(inference, 3, 'A repeat needs no inference calls');
+    securityPass = false;
+    assert.equal((await chat({ request: request({ messages, token: 'invalid' }), env })).status, 403);
+    assert.equal(inference, 3);
+    securityPass = true;
+    await chat({ request: request({ messages: [...messages, { role: 'assistant', content: answer }, ...messages], token: 'valid' }), env });
+    assert.equal(inference, 6, 'History-dependent requests never reuse or populate the shared cache');
+    await chat({ request: request(conversation), env });
+    assert.equal(stored.size, 1, 'Arbitrary visitor questions are not stored');
+    assert.doesNotMatch([...stored.keys()][0], /professional|Tell|Ahmad/);
+    const originalText = chatPassages[0].text;
+    try {
+      chatPassages[0].text += ' Updated public evidence.';
+      await chat({ request: request({ messages, token: 'valid' }), env });
+      assert.equal(stored.size, 2, 'Changing evidence invalidates the previous cache key');
+    } finally { chatPassages[0].text = originalText; }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalCaches) Object.defineProperty(globalThis, 'caches', originalCaches); else Reflect.deleteProperty(globalThis, 'caches');
+  }
+});
+
+test('failed reviews never populate the suggestion cache, and cache outages do not block reviewed answers', async () => {
+  const originalFetch = globalThis.fetch, originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+  let valid = false, puts = 0;
+  Object.defineProperty(globalThis, 'caches', { configurable: true, value: { default: {
+    async match() { throw new Error('Cache unavailable'); },
+    async put() { puts++; throw new Error('Cache unavailable'); },
+  } } });
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+    const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+    const content = stage === 'portfolio_evidence' ? { ids: ['experience'] } : stage === 'portfolio_review' ? { issues: valid ? [] : ['Unsupported'], valid }
+      : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+    return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+  };
+  try {
+    const data = { messages: [{ role: 'user', content: recruiterPrompts[0][1] }], token: 'valid' };
+    assert.equal((await chat({ request: request(data), env })).status, 503);
+    assert.equal(puts, 0);
+    valid = true;
+    assert.equal((await chat({ request: request(data), env })).status, 200);
+    assert.equal(puts, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalCaches) Object.defineProperty(globalThis, 'caches', originalCaches); else Reflect.deleteProperty(globalThis, 'caches');
+  }
+});
+
+test('exhausted free model quotas expose the earliest known retry time without leaking provider errors', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const [hints, seconds] of [
+      [['22.4', '41'], 23], [['120', '60'], 60], [[null, '18'], 18], [['bad', '-1'], undefined], [['Infinity', null], undefined],
+    ] as const) {
+      let calls = 0;
+      globalThis.fetch = async (url) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const hint = hints[calls++];
+        return new Response('SECRET_PROVIDER_DETAIL', { status: 429, headers: hint === null ? {} : { 'Retry-After': hint } });
+      };
+      const response = await chat({ request: request(conversation), env });
+      assert.equal(response.status, 429);
+      assert.equal(calls, 2, 'No immediate retries when both production models are exhausted');
+      assert.equal(response.headers.get('Retry-After'), seconds === undefined ? null : String(seconds));
+      const result = await response.json() as { error: string };
+      assert.equal(result.error, seconds === undefined ? 'The AI Twin has reached its current limit. Please try later or email Ahmad.' : retryMessage(seconds));
+      assert.doesNotMatch(result.error, /SECRET_PROVIDER/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('retry hints cannot turn missing or invalid headers into an indefinite browser wait', () => {
+  for (const value of [null, '', ' ', 'NaN', 'Infinity', '-10', '0', 'tomorrow', '9007199254740992']) assert.equal(retryAfterSeconds(value), undefined);
+  assert.equal(retryAfterSeconds('1.2'), 2);
+  assert.equal(retryMessage(60), 'The AI Twin has reached its current limit. Please try again in 1 minute, or email Ahmad.');
+});
+
+test('a short review quota wait preserves the draft and stops immediately on cancellation', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const cancel of [false, true]) {
+      const controller = new AbortController();
+      let writes = 0, reviews = 0;
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+        if (stage === 'portfolio_review') {
+          reviews++;
+          if (reviews <= 2) {
+            if (reviews === 2 && cancel) setTimeout(() => controller.abort(), 0);
+            return new Response('PRIVATE_PROVIDER_BODY', { status: 429, headers: { 'Retry-After': '0.01' } });
+          }
+        } else if (stage !== 'portfolio_evidence') writes++;
+        const content = stage === 'portfolio_evidence' ? { ids: ['experience'] } : stage === 'portfolio_review' ? { issues: [], valid: true }
+          : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      };
+      const response = await chat({ request: new Request(request({ ...conversation, stream: true }), { signal: controller.signal }), env });
+      assert.equal(writes, 1, 'Waiting never regenerates the completed draft');
+      assert.equal(reviews, cancel ? 2 : 3, 'The model chain retries once after the hint, with no retry after cancellation');
+      assert.equal(response.status, cancel ? 503 : 200);
+      const delivered = await response.text();
+      if (cancel) assert.doesNotMatch(delivered, /event: token|approximately six years/);
+      else assert.match(delivered, /approximately six years/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
 
 test('dynamic replies answer the specific question and pass review before delivery', async () => {
   const originalFetch = globalThis.fetch;
@@ -70,7 +291,7 @@ test('each inference stage uses only production models and falls back after a ra
         assert.ok(['openai/gpt-oss-120b', 'openai/gpt-oss-20b'].includes(payload.model), 'Preview models are never called');
         if (stage === 'writer') assert.equal(payload.response_format.type, 'json_object');
         else assert.equal(payload.response_format.json_schema.strict, true);
-        assert.equal(payload.reasoning_effort, stage === 'portfolio_review' ? 'medium' : 'low');
+        assert.equal(payload.reasoning_effort, stage === 'portfolio_review' && payload.model === 'openai/gpt-oss-120b' ? 'medium' : 'low');
         if (stage === limitedStage) {
           tried.push(payload.model);
           if (tried.length === 1) return new Response('rate limited', { status: 429 });
@@ -160,7 +381,9 @@ test('production reviewers have room for hidden reasoning before a complete JSON
         const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
         if (stage === 'portfolio_review') {
           if (fallback && payload.model === 'openai/gpt-oss-120b') return new Response('rate limited', { status: 429 });
-          // Live career review required 1,383 completion tokens, including hidden reasoning.
+          // Primary medium-effort reviews need reasoning room; an unusually long low-effort
+          // fallback review must still recover with a larger budget on the same draft.
+          if (payload.model === 'openai/gpt-oss-20b') assert.equal(payload.reasoning_effort, 'low');
           if (payload.max_completion_tokens < 1383) return Response.json({ error: { code: 'json_validate_failed' } }, { status: 400 });
           return Response.json({ choices: [{ message: { content: '{"issues":[],"valid":true}' }, finish_reason: 'stop' }] });
         }
@@ -226,7 +449,8 @@ test('a failed review generation retries the same draft once before delivery', a
       const response = await result.text();
       assert.equal(result.status, ['exhausted', 'auth'].includes(failure) ? 503 : 200, failure);
       assert.equal(writes, 1, 'A review-format retry does not consume or regenerate a writer draft');
-      assert.deepEqual(reviews.map(review => review.reasoning_effort), failure === 'auth' ? ['medium'] : ['medium', 'low']);
+      assert.deepEqual(reviews.map(review => review.reasoning_effort), failure === 'auth' ? ['low'] : ['low', 'low']);
+      assert.deepEqual(reviews.map(review => review.max_completion_tokens), failure === 'auth' ? [1200] : [1200, 2400], 'Fallback reviews reserve less quota first and recover once with more room');
       if (result.status === 200) assert.match(response, /up to 30,000 requests/);
       else assert.doesNotMatch(response, /up to 30,000|event: token|private provider detail/);
     }

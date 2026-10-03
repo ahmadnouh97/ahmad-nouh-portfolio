@@ -20,7 +20,7 @@ export const chatPassages = [
   passage('working-style', 'Working style', profile.style),
   ...cases.flatMap(c => [
     passage(`${c.slug}-overview`, `${c.name} · Overview`, `${c.role} · ${c.period} · ${c.location}. ${c.headquarters ? `Company headquarters: ${c.headquarters}. ` : ''}${c.intro}\n\n${c.summary}`, `/work/${c.slug}/`),
-    ...c.sections.map((s, i) => passage(`${c.slug}-${i}`, `${c.name} · ${s.title}`, c.slug === 'blink' && i === 1 ? s.paragraphs[0] : s.paragraphs.join('\n\n'), `/work/${c.slug}/`)),
+    ...c.sections.map((s, i) => passage(`${c.slug}-${i}`, `${c.name} · ${s.title}`, `${c.role} · ${c.period} · ${c.location}.\n\n${c.slug === 'blink' && i === 1 ? s.paragraphs[0] : s.paragraphs.join('\n\n')}`, `/work/${c.slug}/`)),
   ]),
   passage('blink-ocr', 'Blink · OCR-assisted document extraction', knowledgeNotes.blinkExtraction, '/work/blink/'),
   ...skills.map((s, i) => passage(`skills-${i}`, s.name, `${s.description}\n\nContext: ${s.context}. Tools used across that work: ${s.tools.join(', ')}.`, '/#skills')),
@@ -34,6 +34,18 @@ export const chatPassages = [
   passage('languages', 'Languages', `${languages.join('\n')}\n\n${knowledgeNotes.language}`),
   passage('contact', 'Contact Ahmad', `Email: ${profile.email}\nLinkedIn: ${profile.linkedin}\nGitHub: ${profile.github}\nYou can also use the portfolio contact form.`, '/#contact'),
 ];
+
+// Short routing labels retain tool names and delivery/evaluation scope without sending passage previews.
+const topicLabels = new Map<string, string>([
+  ...skills.map((group, index) => [`skills-${index}`, `${group.name}; ${group.tools.join(', ')}`] as const),
+  ...cases.flatMap(c => c.sections.map((section, index) => {
+    const id = `${c.slug}-${index}`;
+    const text = chatPassages.find(p => p.id === id)!.text;
+    const tools = c.stack.filter(tool => text.includes(tool));
+    return [id, `${c.name} · ${section.title} (${section.label})${tools.length ? '; ' + tools.join(', ') : ''}`] as const;
+  })),
+]);
+export const retrievalCatalog = chatPassages.map(({ id, title }) => `${id}: ${topicLabels.get(id) ?? title}`).join('\n');
 
 export const evidenceFormat = {
   type: 'json_schema',

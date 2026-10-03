@@ -18,6 +18,155 @@ const env: Env = { SITE_ORIGIN: 'https://me.nouhlab.com', GROQ_API_KEY: 'test-gr
 const request = (data: unknown, origin = env.SITE_ORIGIN) => new Request(`${env.SITE_ORIGIN}/api/chat`, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
 const conversation = { messages: [{ role: 'user', content: 'What did Ahmad build at Blink?' }], token: 'valid' };
 
+test('Cloudflare production fallbacks retain structured retrieval, complete drafts, and factual review', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const rateCloudflare of [false, true]) {
+      const models: string[] = [], stages: string[] = [];
+      globalThis.fetch = async (url) => String(url).includes('siteverify')
+        ? Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' }) : new Response('limited', { status: 429 });
+      const aiEnv: Env = { ...env, AI: { async run(model, input, options) {
+        models.push(model);
+        assert.equal(options.returnRawResponse, true);
+        assert.ok(options.signal instanceof AbortSignal);
+        assert.equal(input.stream, false);
+        assert.equal(input.reasoning_format, undefined);
+        assert.equal(input.max_completion_tokens, undefined);
+        if (rateCloudflare && model === '@cf/openai/gpt-oss-20b') return new Response('capacity', { status: 429 });
+        const format = input.response_format as { type: string; json_schema?: { properties: Record<string, unknown> } };
+        const stage = format.type === 'json_object' ? 'writer' : 'valid' in format.json_schema!.properties ? 'review' : 'retrieval';
+        stages.push(stage);
+        assert.equal(input.max_tokens, stage === 'retrieval' ? 300 : stage === 'writer' ? 1800 : rateCloudflare ? 2400 : 1200);
+        const content = stage === 'retrieval' ? { ids: ['experience'] } : stage === 'review' ? { issues: [], valid: true }
+          : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      } } };
+      const response = await chat({ request: request(conversation), env: aiEnv });
+      assert.equal(response.status, 200);
+      assert.deepEqual(stages, ['retrieval', 'writer', 'review']);
+      assert.deepEqual(models, Array.from({ length: 3 }, () => rateCloudflare ? ['@cf/openai/gpt-oss-20b', '@cf/openai/gpt-oss-120b'] : ['@cf/openai/gpt-oss-20b']).flat());
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('Cloudflare quota exhaustion and permanent failures stop bounded fallback without publishing a draft', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const status of [429, 403, 500]) {
+      let calls = 0;
+      globalThis.fetch = async (url) => String(url).includes('siteverify')
+        ? Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' }) : new Response('limited', { status: 429 });
+      const response = await chat({ request: request({ ...conversation, stream: true }), env: { ...env, AI: { async run() {
+        calls++;
+        return new Response('PRIVATE_CF_ERROR', { status });
+      } } } });
+      assert.equal(calls, status === 429 ? 2 : 1);
+      assert.equal(response.status, status === 429 ? 429 : 503);
+      assert.doesNotMatch(await response.text(), /PRIVATE_CF_ERROR|event: token/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('Cloudflare malformed or rejected reviews fail closed and cancellation reaches the binding', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const failure of ['malformed', 'rejected', 'cancelled']) {
+      const controller = new AbortController();
+      let reviews = 0;
+      globalThis.fetch = async (url) => String(url).includes('siteverify')
+        ? Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' }) : new Response('limited', { status: 429 });
+      const response = await chat({ request: new Request(request({ ...conversation, stream: true }), { signal: controller.signal }), env: { ...env, AI: { async run(_model, input, options) {
+        if (failure === 'cancelled') {
+          controller.abort();
+          assert.equal(options.signal.aborted, true);
+          options.signal.throwIfAborted();
+        }
+        const schema = (input.response_format as any).json_schema;
+        let content: unknown;
+        if (schema?.properties.valid) { reviews++; content = failure === 'malformed' ? { valid: true } : { issues: ['Unsupported claim'], valid: false }; }
+        else content = schema ? { ids: ['experience'] } : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      } } } });
+      assert.equal(response.status, 503);
+      assert.equal(reviews, failure === 'cancelled' ? 0 : 2);
+      assert.doesNotMatch(await response.text(), /event: token|approximately six years/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('only reviewed standalone public suggestions are cached; security and conversation context still apply', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+  const stored = new Map<string, Response>();
+  let inference = 0, securityPass = true;
+  Object.defineProperty(globalThis, 'caches', { configurable: true, value: { default: {
+    async match(key: Request) { return stored.get(key.url)?.clone(); },
+    async put(key: Request, response: Response) { assert.equal(response.headers.get('Cache-Control'), 'public, max-age=600'); stored.set(key.url, response); },
+  } } });
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('siteverify')) return Response.json({ success: securityPass, hostname: 'me.nouhlab.com', action: 'chat' });
+    inference++;
+    const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+    const content = stage === 'portfolio_evidence' ? { ids: ['experience'] } : stage === 'portfolio_review' ? { issues: [], valid: true }
+      : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+    return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+  };
+  try {
+    const messages = [{ role: 'user', content: recruiterPrompts[0][1] }];
+    const first = await chat({ request: request({ messages, token: 'valid' }), env });
+    const answer = (await first.json() as any).answer;
+    assert.equal(stored.size, 1);
+    const second = await chat({ request: request({ messages, token: 'valid', stream: true }), env });
+    assert.match(await second.text(), /event: token/);
+    assert.equal(inference, 3, 'A repeat needs no inference calls');
+    securityPass = false;
+    assert.equal((await chat({ request: request({ messages, token: 'invalid' }), env })).status, 403);
+    assert.equal(inference, 3);
+    securityPass = true;
+    await chat({ request: request({ messages: [...messages, { role: 'assistant', content: answer }, ...messages], token: 'valid' }), env });
+    assert.equal(inference, 6, 'History-dependent requests never reuse or populate the shared cache');
+    await chat({ request: request(conversation), env });
+    assert.equal(stored.size, 1, 'Arbitrary visitor questions are not stored');
+    assert.doesNotMatch([...stored.keys()][0], /professional|Tell|Ahmad/);
+    const originalText = chatPassages[0].text;
+    try {
+      chatPassages[0].text += ' Updated public evidence.';
+      await chat({ request: request({ messages, token: 'valid' }), env });
+      assert.equal(stored.size, 2, 'Changing evidence invalidates the previous cache key');
+    } finally { chatPassages[0].text = originalText; }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalCaches) Object.defineProperty(globalThis, 'caches', originalCaches); else Reflect.deleteProperty(globalThis, 'caches');
+  }
+});
+
+test('failed reviews never populate the suggestion cache, and cache outages do not block reviewed answers', async () => {
+  const originalFetch = globalThis.fetch, originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+  let valid = false, puts = 0;
+  Object.defineProperty(globalThis, 'caches', { configurable: true, value: { default: {
+    async match() { throw new Error('Cache unavailable'); },
+    async put() { puts++; throw new Error('Cache unavailable'); },
+  } } });
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+    const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+    const content = stage === 'portfolio_evidence' ? { ids: ['experience'] } : stage === 'portfolio_review' ? { issues: valid ? [] : ['Unsupported'], valid }
+      : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+    return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+  };
+  try {
+    const data = { messages: [{ role: 'user', content: recruiterPrompts[0][1] }], token: 'valid' };
+    assert.equal((await chat({ request: request(data), env })).status, 503);
+    assert.equal(puts, 0);
+    valid = true;
+    assert.equal((await chat({ request: request(data), env })).status, 200);
+    assert.equal(puts, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalCaches) Object.defineProperty(globalThis, 'caches', originalCaches); else Reflect.deleteProperty(globalThis, 'caches');
+  }
+});
+
 test('exhausted free model quotas expose the earliest known retry time without leaking provider errors', async () => {
   const originalFetch = globalThis.fetch;
   try {

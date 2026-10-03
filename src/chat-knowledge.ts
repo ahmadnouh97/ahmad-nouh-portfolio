@@ -41,7 +41,7 @@ export const evidenceFormat = {
     name: 'portfolio_evidence', strict: true,
     schema: {
       type: 'object', additionalProperties: false, required: ['ids'],
-      properties: { ids: { type: 'array', items: { type: 'string', enum: chatPassages.map(p => p.id) } } },
+      properties: { ids: { type: 'array', maxItems: 6, items: { type: 'string', enum: chatPassages.map(p => p.id) } } },
     },
   },
 };
@@ -67,6 +67,12 @@ export function evidenceFor(ids: unknown) {
     if (!found) throw new Error('Unknown evidence.');
     return found;
   });
+}
+
+export function selectedEvidence(ids: unknown) {
+  if (!Array.isArray(ids)) throw new Error('Invalid evidence.');
+  // Resolve every ID before capping the context; unknown IDs must never be silently discarded.
+  return [...new Set(ids)].map(id => evidenceFor([id])[0]).slice(0, 6);
 }
 
 export function validateDraft(value: unknown): { answer: string; ids: string[] } {

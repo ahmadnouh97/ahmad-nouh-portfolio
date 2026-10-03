@@ -20,7 +20,7 @@ export const chatPassages = [
   passage('working-style', 'Working style', profile.style),
   ...cases.flatMap(c => [
     passage(`${c.slug}-overview`, `${c.name} · Overview`, `${c.role} · ${c.period} · ${c.location}. ${c.headquarters ? `Company headquarters: ${c.headquarters}. ` : ''}${c.intro}\n\n${c.summary}`, `/work/${c.slug}/`),
-    ...c.sections.map((s, i) => passage(`${c.slug}-${i}`, `${c.name} · ${s.title}`, c.slug === 'blink' && i === 1 ? s.paragraphs[0] : s.paragraphs.join('\n\n'), `/work/${c.slug}/`)),
+    ...c.sections.map((s, i) => passage(`${c.slug}-${i}`, `${c.name} · ${s.title}`, `${c.role} · ${c.period} · ${c.location}.\n\n${c.slug === 'blink' && i === 1 ? s.paragraphs[0] : s.paragraphs.join('\n\n')}`, `/work/${c.slug}/`)),
   ]),
   passage('blink-ocr', 'Blink · OCR-assisted document extraction', knowledgeNotes.blinkExtraction, '/work/blink/'),
   ...skills.map((s, i) => passage(`skills-${i}`, s.name, `${s.description}\n\nContext: ${s.context}. Tools used across that work: ${s.tools.join(', ')}.`, '/#skills')),

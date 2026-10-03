@@ -18,10 +18,20 @@ const env: Env = { SITE_ORIGIN: 'https://me.nouhlab.com', GROQ_API_KEY: 'test-gr
 const request = (data: unknown, origin = env.SITE_ORIGIN) => new Request(`${env.SITE_ORIGIN}/api/chat`, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
 const conversation = { messages: [{ role: 'user', content: 'What did Ahmad build at Blink?' }], token: 'valid' };
 
+test('retrieved employer contributions carry their own documented role and dates', () => {
+  for (const employer of cases) {
+    for (const [index] of employer.sections.entries()) {
+      const contribution = chatPassages.find(p => p.id === `${employer.slug}-${index}`)!;
+      assert.ok(contribution.text.includes(employer.role), contribution.id);
+      assert.ok(contribution.text.includes(employer.period), contribution.id);
+    }
+  }
+});
+
 test('Cloudflare production fallbacks retain structured retrieval, complete drafts, and factual review', async () => {
   const originalFetch = globalThis.fetch;
   try {
-    for (const rateCloudflare of [false, true]) {
+    {
       const models: string[] = [], stages: string[] = [];
       globalThis.fetch = async (url) => String(url).includes('siteverify')
         ? Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' }) : new Response('limited', { status: 429 });
@@ -32,11 +42,12 @@ test('Cloudflare production fallbacks retain structured retrieval, complete draf
         assert.equal(input.stream, false);
         assert.equal(input.reasoning_format, undefined);
         assert.equal(input.max_completion_tokens, undefined);
-        if (rateCloudflare && model === '@cf/openai/gpt-oss-20b') return new Response('capacity', { status: 429 });
-        const format = input.response_format as { type: string; json_schema?: { properties: Record<string, unknown> } };
-        const stage = format.type === 'json_object' ? 'writer' : 'valid' in format.json_schema!.properties ? 'review' : 'retrieval';
+        const format = input.response_format as { type: string; json_schema: { properties: Record<string, unknown>; required: string[] } };
+        assert.equal(format.type, 'json_schema', 'Cloudflare writing requests a native schema instead of unconstrained JSON-object mode');
+        const stage = 'answer' in format.json_schema.properties ? 'writer' : 'valid' in format.json_schema.properties ? 'review' : 'retrieval';
+        if (stage === 'writer') assert.deepEqual(format.json_schema.required, ['answer', 'ids']);
         stages.push(stage);
-        assert.equal(input.max_tokens, stage === 'retrieval' ? 300 : stage === 'writer' ? 1800 : rateCloudflare ? 2400 : 1200);
+        assert.equal(input.max_tokens, stage === 'retrieval' ? 300 : stage === 'writer' ? 1800 : 1200);
         const content = stage === 'retrieval' ? { ids: ['experience'] } : stage === 'review' ? { issues: [], valid: true }
           : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
         return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
@@ -44,7 +55,7 @@ test('Cloudflare production fallbacks retain structured retrieval, complete draf
       const response = await chat({ request: request(conversation), env: aiEnv });
       assert.equal(response.status, 200);
       assert.deepEqual(stages, ['retrieval', 'writer', 'review']);
-      assert.deepEqual(models, Array.from({ length: 3 }, () => rateCloudflare ? ['@cf/openai/gpt-oss-20b', '@cf/openai/gpt-oss-120b'] : ['@cf/openai/gpt-oss-20b']).flat());
+      assert.deepEqual(models, Array.from({ length: 3 }, () => '@cf/openai/gpt-oss-20b'));
     }
   } finally { globalThis.fetch = originalFetch; }
 });
@@ -60,7 +71,7 @@ test('Cloudflare quota exhaustion and permanent failures stop bounded fallback w
         calls++;
         return new Response('PRIVATE_CF_ERROR', { status });
       } } } });
-      assert.equal(calls, status === 429 ? 2 : 1);
+      assert.equal(calls, 1, 'Only the live-verified Cloudflare model is attempted');
       assert.equal(response.status, status === 429 ? 429 : 503);
       assert.doesNotMatch(await response.text(), /PRIVATE_CF_ERROR|event: token/);
     }
@@ -84,7 +95,7 @@ test('Cloudflare malformed or rejected reviews fail closed and cancellation reac
         const schema = (input.response_format as any).json_schema;
         let content: unknown;
         if (schema?.properties.valid) { reviews++; content = failure === 'malformed' ? { valid: true } : { issues: ['Unsupported claim'], valid: false }; }
-        else content = schema ? { ids: ['experience'] } : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+        else content = schema?.properties.answer ? { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] } : { ids: ['experience'] };
         return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
       } } } });
       assert.equal(response.status, 503);

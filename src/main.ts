@@ -2,6 +2,7 @@ import './style.css';
 import { readEvents } from './stream.ts';
 import { chatRequest } from './chat-limits.ts';
 import { answerBlocks } from './chat-format.ts';
+import { retryAfterSeconds, retryMessage } from './chat-retry.ts';
 
 const root = document.documentElement;
 const systemDark = matchMedia('(prefers-color-scheme: dark)');
@@ -118,6 +119,18 @@ const stopButton = document.querySelector<HTMLButtonElement>('#stop-chat')!;
 const clearButton = document.querySelector<HTMLButtonElement>('#clear-chat')!;
 let messages: Message[] = [];
 let chatBusy = false, closing = false;
+let retryUntil = 0;
+let retryTimer: ReturnType<typeof setTimeout> | undefined;
+function updateRetry() {
+  clearTimeout(retryTimer);
+  const remaining = retryUntil - Date.now();
+  sendButton.disabled = remaining > 0;
+  if (remaining > 0) retryTimer = setTimeout(updateRetry, Math.min(remaining, 60000));
+  else if (retryUntil) {
+    retryUntil = 0;
+    if (!chatBusy) chatStatus.textContent = 'You can try sending your question again.';
+  }
+}
 let activeRequest: AbortController | undefined;
 let openingButton: HTMLElement | undefined;
 const animateDialog = (opening: boolean) => {
@@ -159,7 +172,7 @@ dialog.addEventListener('click', event => {
 });
 clearButton.addEventListener('click', () => {
   if (chatBusy) return;
-  messages = []; log.innerHTML = initialGreeting; chatStatus.textContent = ''; announcement.textContent = ''; chatInput.value = ''; chatInput.focus();
+  messages = []; log.innerHTML = initialGreeting; chatStatus.textContent = retryUntil > Date.now() ? retryMessage(Math.ceil((retryUntil - Date.now()) / 1000)) : ''; announcement.textContent = ''; chatInput.value = ''; chatInput.focus();
 });
 stopButton.addEventListener('click', () => activeRequest?.abort());
 function appendMessage(role: Message['role'], content: string) {
@@ -177,6 +190,7 @@ chatForm.addEventListener('submit', async event => {
   event.preventDefault();
   const question = chatInput.value.trim();
   if (chatBusy || !question) return;
+  if (retryUntil > Date.now()) { chatStatus.textContent = retryMessage(Math.ceil((retryUntil - Date.now()) / 1000)); return; }
   chatBusy = true; activeRequest = new AbortController();
   const signal = activeRequest.signal;
   sendButton.hidden = true; stopButton.hidden = false; clearButton.disabled = true;
@@ -205,6 +219,10 @@ chatForm.addEventListener('submit', async event => {
     const history = payload.messages;
     const response = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.any([signal, AbortSignal.timeout(60000)]) });
     if (!response.ok) {
+      if (response.status === 429) {
+        const seconds = retryAfterSeconds(response.headers.get('Retry-After'));
+        if (seconds !== undefined) { retryUntil = Date.now() + seconds * 1000; updateRetry(); }
+      }
       const result = await response.json() as { error?: string };
       throw new Error(result.error || 'The Twin is temporarily unavailable. Please try again.');
     }

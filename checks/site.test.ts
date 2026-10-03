@@ -12,10 +12,71 @@ import type { Env } from '../functions/api/_shared.ts';
 import { verifyTurnstile } from '../functions/api/_shared.ts';
 import { readEvents } from '../src/stream.ts';
 import { groundedAnswer, chatPassages, recruiterPrompts, validateDraft } from '../src/chat-knowledge.ts';
+import { retryAfterSeconds, retryMessage } from '../src/chat-retry.ts';
 
 const env: Env = { SITE_ORIGIN: 'https://me.nouhlab.com', GROQ_API_KEY: 'test-groq', RESEND_API_KEY: 'test-resend', TURNSTILE_SECRET_KEY: 'test-secret', TURNSTILE_SITE_KEY: 'test-public', LEAD_FROM: 'Portfolio <portfolio@me.nouhlab.com>' };
 const request = (data: unknown, origin = env.SITE_ORIGIN) => new Request(`${env.SITE_ORIGIN}/api/chat`, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
 const conversation = { messages: [{ role: 'user', content: 'What did Ahmad build at Blink?' }], token: 'valid' };
+
+test('exhausted free model quotas expose the earliest known retry time without leaking provider errors', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const [hints, seconds] of [
+      [['22.4', '41'], 23], [['120', '60'], 60], [[null, '18'], 18], [['bad', '-1'], undefined], [['Infinity', null], undefined],
+    ] as const) {
+      let calls = 0;
+      globalThis.fetch = async (url) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const hint = hints[calls++];
+        return new Response('SECRET_PROVIDER_DETAIL', { status: 429, headers: hint === null ? {} : { 'Retry-After': hint } });
+      };
+      const response = await chat({ request: request(conversation), env });
+      assert.equal(response.status, 429);
+      assert.equal(calls, 2, 'No immediate retries when both production models are exhausted');
+      assert.equal(response.headers.get('Retry-After'), seconds === undefined ? null : String(seconds));
+      const result = await response.json() as { error: string };
+      assert.equal(result.error, seconds === undefined ? 'The AI Twin has reached its current limit. Please try later or email Ahmad.' : retryMessage(seconds));
+      assert.doesNotMatch(result.error, /SECRET_PROVIDER/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('retry hints cannot turn missing or invalid headers into an indefinite browser wait', () => {
+  for (const value of [null, '', ' ', 'NaN', 'Infinity', '-10', '0', 'tomorrow', '9007199254740992']) assert.equal(retryAfterSeconds(value), undefined);
+  assert.equal(retryAfterSeconds('1.2'), 2);
+  assert.equal(retryMessage(60), 'The AI Twin has reached its current limit. Please try again in 1 minute, or email Ahmad.');
+});
+
+test('a short review quota wait preserves the draft and stops immediately on cancellation', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const cancel of [false, true]) {
+      const controller = new AbortController();
+      let writes = 0, reviews = 0;
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+        if (stage === 'portfolio_review') {
+          reviews++;
+          if (reviews <= 2) {
+            if (reviews === 2 && cancel) setTimeout(() => controller.abort(), 0);
+            return new Response('PRIVATE_PROVIDER_BODY', { status: 429, headers: { 'Retry-After': '0.01' } });
+          }
+        } else if (stage !== 'portfolio_evidence') writes++;
+        const content = stage === 'portfolio_evidence' ? { ids: ['experience'] } : stage === 'portfolio_review' ? { issues: [], valid: true }
+          : { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      };
+      const response = await chat({ request: new Request(request({ ...conversation, stream: true }), { signal: controller.signal }), env });
+      assert.equal(writes, 1, 'Waiting never regenerates the completed draft');
+      assert.equal(reviews, cancel ? 2 : 3, 'The model chain retries once after the hint, with no retry after cancellation');
+      assert.equal(response.status, cancel ? 503 : 200);
+      const delivered = await response.text();
+      if (cancel) assert.doesNotMatch(delivered, /event: token|approximately six years/);
+      else assert.match(delivered, /approximately six years/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
 
 test('dynamic replies answer the specific question and pass review before delivery', async () => {
   const originalFetch = globalThis.fetch;
@@ -70,7 +131,7 @@ test('each inference stage uses only production models and falls back after a ra
         assert.ok(['openai/gpt-oss-120b', 'openai/gpt-oss-20b'].includes(payload.model), 'Preview models are never called');
         if (stage === 'writer') assert.equal(payload.response_format.type, 'json_object');
         else assert.equal(payload.response_format.json_schema.strict, true);
-        assert.equal(payload.reasoning_effort, stage === 'portfolio_review' ? 'medium' : 'low');
+        assert.equal(payload.reasoning_effort, stage === 'portfolio_review' && payload.model === 'openai/gpt-oss-120b' ? 'medium' : 'low');
         if (stage === limitedStage) {
           tried.push(payload.model);
           if (tried.length === 1) return new Response('rate limited', { status: 429 });
@@ -160,7 +221,9 @@ test('production reviewers have room for hidden reasoning before a complete JSON
         const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
         if (stage === 'portfolio_review') {
           if (fallback && payload.model === 'openai/gpt-oss-120b') return new Response('rate limited', { status: 429 });
-          // Live career review required 1,383 completion tokens, including hidden reasoning.
+          // Primary medium-effort reviews need reasoning room; an unusually long low-effort
+          // fallback review must still recover with a larger budget on the same draft.
+          if (payload.model === 'openai/gpt-oss-20b') assert.equal(payload.reasoning_effort, 'low');
           if (payload.max_completion_tokens < 1383) return Response.json({ error: { code: 'json_validate_failed' } }, { status: 400 });
           return Response.json({ choices: [{ message: { content: '{"issues":[],"valid":true}' }, finish_reason: 'stop' }] });
         }
@@ -226,7 +289,8 @@ test('a failed review generation retries the same draft once before delivery', a
       const response = await result.text();
       assert.equal(result.status, ['exhausted', 'auth'].includes(failure) ? 503 : 200, failure);
       assert.equal(writes, 1, 'A review-format retry does not consume or regenerate a writer draft');
-      assert.deepEqual(reviews.map(review => review.reasoning_effort), failure === 'auth' ? ['medium'] : ['medium', 'low']);
+      assert.deepEqual(reviews.map(review => review.reasoning_effort), failure === 'auth' ? ['low'] : ['low', 'low']);
+      assert.deepEqual(reviews.map(review => review.max_completion_tokens), failure === 'auth' ? [1200] : [1200, 2400], 'Fallback reviews reserve less quota first and recover once with more room');
       if (result.status === 200) assert.match(response, /up to 30,000 requests/);
       else assert.doesNotMatch(response, /up to 30,000|event: token|private provider detail/);
     }

@@ -35,6 +35,18 @@ export const chatPassages = [
   passage('contact', 'Contact Ahmad', `Email: ${profile.email}\nLinkedIn: ${profile.linkedin}\nGitHub: ${profile.github}\nYou can also use the portfolio contact form.`, '/#contact'),
 ];
 
+// Short routing labels retain tool names and delivery/evaluation scope without sending passage previews.
+const topicLabels = new Map<string, string>([
+  ...skills.map((group, index) => [`skills-${index}`, `${group.name}; ${group.tools.join(', ')}`] as const),
+  ...cases.flatMap(c => c.sections.map((section, index) => {
+    const id = `${c.slug}-${index}`;
+    const text = chatPassages.find(p => p.id === id)!.text;
+    const tools = c.stack.filter(tool => text.includes(tool));
+    return [id, `${c.name} · ${section.title} (${section.label})${tools.length ? '; ' + tools.join(', ') : ''}`] as const;
+  })),
+]);
+export const retrievalCatalog = chatPassages.map(({ id, title }) => `${id}: ${topicLabels.get(id) ?? title}`).join('\n');
+
 export const evidenceFormat = {
   type: 'json_schema',
   json_schema: {

@@ -133,6 +133,44 @@ test('model fallbacks are bounded and stop for permanent failures or cancellatio
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('a failed review generation retries the same draft once before delivery', async () => {
+  const originalFetch = globalThis.fetch;
+  const draft = { answer: 'At Lableb, Ahmad built a B2B spam-classification service handling up to 30,000 requests per day and filtering about 90% of spam queries.', ids: ['lableb-0'] };
+  try {
+    for (const failure of ['provider-json', 'incomplete', 'invalid-json', 'invalid-shape', 'exhausted', 'auth']) {
+      let writes = 0;
+      const reviews: any[] = [];
+      globalThis.fetch = async (url, init) => {
+        if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+        const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+        if (stage === 'portfolio_review' && payload.model === 'openai/gpt-oss-120b') return new Response('limit', { status: 429 });
+        if (stage === 'portfolio_review') {
+          reviews.push(payload);
+          assert.deepEqual(JSON.parse(payload.messages[1].content).draft, draft, 'A failed review never changes or publishes the draft');
+          if (failure === 'auth') return new Response('private provider detail', { status: 401 });
+          if (reviews.length === 1 || failure === 'exhausted') {
+            if (failure === 'incomplete') return Response.json({ choices: [{ message: { content: '{"issues":[],"valid":true}' }, finish_reason: 'length' }] });
+            if (failure === 'invalid-json') return Response.json({ choices: [{ message: { content: '{' }, finish_reason: 'stop' }] });
+            if (failure === 'invalid-shape') return Response.json({ choices: [{ message: { content: '{"valid":true}' }, finish_reason: 'stop' }] });
+            return Response.json({ error: { code: 'json_validate_failed' } }, { status: 400 });
+          }
+          return Response.json({ choices: [{ message: { content: '{"issues":[],"valid":true}' }, finish_reason: 'stop' }] });
+        }
+        if (stage !== 'portfolio_evidence') writes++;
+        const content = stage === 'portfolio_evidence' ? { ids: ['lableb-0'] } : draft;
+        return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+      };
+      const result = await chat({ request: request({ ...conversation, stream: true }), env });
+      const response = await result.text();
+      assert.equal(result.status, ['exhausted', 'auth'].includes(failure) ? 503 : 200, failure);
+      assert.equal(writes, 1, 'A review-format retry does not consume or regenerate a writer draft');
+      assert.deepEqual(reviews.map(review => review.reasoning_effort), failure === 'auth' ? ['medium'] : ['medium', 'low']);
+      if (result.status === 200) assert.match(response, /up to 30,000 requests/);
+      else assert.doesNotMatch(response, /up to 30,000|event: token|private provider detail/);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('malformed writer outputs get one correction and factual review before delivery', async () => {
   const originalFetch = globalThis.fetch;
   const good = { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] };
@@ -423,6 +461,40 @@ test('social wording and mixed professional questions use model evidence selecti
       assert.equal((await response.json() as any).answer, answer);
       assert.equal(selections, 1, 'Every phrasing reaches semantic evidence selection');
       assert.equal(reviews, 1, 'Social replies still undergo review');
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('mixed employer results use factual review without rejecting documented Blink tools', async () => {
+  const originalFetch = globalThis.fetch;
+  const answer = 'At Blink, Ahmad designed a feature-flagged LangGraph flight-creation agent with five integrated tools; at MENT, he improved attribution by approximately 33%, with the exact metric definition undocumented.';
+  const ids = ['blink-1', 'ment-1'];
+  try {
+    for (const [text, approved] of [[answer, true], ['At MENT, Ahmad built a LangGraph agent; at Blink, he designed flight-creation workflows.', false]] as const) {
+      for (const stream of [false, true]) {
+        let writes = 0, reviews = 0;
+        globalThis.fetch = async (url, init) => {
+          if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+          const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+          if (stage === 'portfolio_review') {
+            reviews++;
+            const reviewed = JSON.parse(payload.messages[1].content);
+            assert.equal(reviewed.draft.answer, text);
+            assert.deepEqual(reviewed.draft.ids, ids);
+            assert.match(payload.messages[0].content, /MENT agent workflows use n8n and MCP/);
+          }
+          if (stage !== 'portfolio_evidence' && stage !== 'portfolio_review') writes++;
+          const content = stage === 'portfolio_evidence' ? { ids } : stage === 'portfolio_review' ? { issues: approved ? [] : ['LangGraph is attributed to MENT without support.'], valid: approved } : { answer: text, ids };
+          return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+        };
+        const response = await chat({ request: request({ ...conversation, messages: [{ role: 'user', content: 'What has Ahmad delivered, and what results did he achieve?' }], stream }), env });
+        assert.equal(response.status, approved ? 200 : 503);
+        assert.equal(reviews, approved ? 1 : 2, 'Mixed employer attribution is checked against full evidence before delivery');
+        assert.equal(writes, approved ? 1 : 2);
+        const delivered = await response.text();
+        if (approved) assert.match(delivered, /At Blink, Ahmad designed/);
+        else assert.doesNotMatch(delivered, /event: token|At MENT, Ahmad built/);
+      }
     }
   } finally { globalThis.fetch = originalFetch; }
 });

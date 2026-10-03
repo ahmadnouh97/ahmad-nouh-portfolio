@@ -89,6 +89,68 @@ test('each inference stage uses only production models and falls back after a ra
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('skills follow-ups cap valid retrieval selections without relaxing writer citations', async () => {
+  const originalFetch = globalThis.fetch;
+  const skillIds = Array.from({ length: 7 }, (_, index) => `skills-${index}`);
+  try {
+    for (const fallback of [false, true]) {
+      for (const stream of [false, true]) {
+        let turn = 0, writes = 0, reviews = 0;
+        globalThis.fetch = async (url, init) => {
+          if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+          const payload = JSON.parse(init?.body as string), stage = payload.response_format.json_schema?.name;
+          if (fallback && payload.model === 'openai/gpt-oss-120b') return new Response('limit', { status: 429 });
+          if (stage === 'portfolio_evidence') {
+            turn++;
+            return Response.json({ choices: [{ message: { content: JSON.stringify({ ids: turn === 1 ? ['experience'] : ['skills-0', ...skillIds] }) }, finish_reason: 'stop' }] });
+          }
+          const draft = turn === 1 ? { answer: 'Ahmad has approximately six years of professional AI engineering experience through July 2026.', ids: ['experience'] }
+            : { answer: 'Ahmad’s strongest technical skills connect Python backend engineering with LLM applications, retrieval, and Arabic NLP.', ids: skillIds.slice(0, 6) };
+          if (stage === 'portfolio_review') {
+            reviews++;
+            assert.deepEqual(JSON.parse(payload.messages[1].content).draft, draft);
+          } else {
+            writes++;
+            if (turn === 2) {
+              const supplied = JSON.parse(payload.messages[0].content.split('\nPublic evidence:\n')[1]);
+              assert.deepEqual(supplied.map((item: any) => item.id), [...skillIds.slice(0, 6), 'boundaries'], 'Deduplicate before keeping the first six valid ranked selections');
+              assert.equal(payload.messages[2].role, 'assistant', 'The follow-up retains the preceding reviewed reply');
+            }
+          }
+          const content = stage === 'portfolio_review' ? { issues: [], valid: true } : draft;
+          return Response.json({ choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }] });
+        };
+        const firstMessage = { role: 'user', content: 'Tell me about Ahmad’s professional experience.' };
+        const first = await chat({ request: request({ ...conversation, messages: [firstMessage] }), env });
+        assert.equal(first.status, 200);
+        const previous = (await first.json() as any).answer;
+        const response = await chat({ request: request({ ...conversation, messages: [firstMessage, { role: 'assistant', content: previous }, { role: 'user', content: 'What are Ahmad’s strongest technical skills?' }], stream }), env });
+        assert.equal(response.status, 200, 'Extra known selections must not turn a skills follow-up into a verification failure');
+        assert.match(await response.text(), /strongest technical skills/);
+        assert.equal(writes, 2);
+        assert.equal(reviews, 2, 'Both replies must pass factual review');
+      }
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('retrieval rejects unknown IDs even after the selected context limit', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('siteverify')) return Response.json({ success: true, hostname: 'me.nouhlab.com', action: 'chat' });
+    calls++;
+    return Response.json({ choices: [{ message: { content: JSON.stringify({ ids: ['skills-0', 'skills-1', 'skills-2', 'skills-3', 'skills-4', 'skills-5', 'unknown-secret-id'] }) }, finish_reason: 'stop' }] });
+  };
+  try {
+    const response = await chat({ request: request(conversation), env });
+    assert.equal(response.status, 503);
+    assert.equal(calls, 1, 'Invalid selection never reaches writing or review');
+    assert.doesNotMatch(await response.text(), /unknown-secret-id/);
+    assert.throws(() => validateDraft({ answer: 'Unsupported extra citations.', ids: Array.from({ length: 7 }, (_, index) => `skills-${index}`) }), /Invalid evidence/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('production reviewers have room for hidden reasoning before a complete JSON decision', async () => {
   const originalFetch = globalThis.fetch;
   try {

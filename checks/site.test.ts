@@ -627,8 +627,16 @@ test('public content stays attributed and excludes private profile details', asy
   assert.match(JSON.stringify(cases[3]), /hosted Groq/);
   assert.ok(languages.includes('Turkish - Elementary proficiency'));
   assert.doesNotMatch(publicFacts, /\+90|Limited working|salary|residence.permit|Eyüpsultan|20%/i);
-  assert.match(cases[1].location, /Istanbul.*Hybrid/);
-  assert.match(cases[2].location, /Damascus.*Hybrid/);
+  assert.deepEqual(cases.slice(0, 3).map(c => [c.location, c.headquarters]), [
+    ['Remote', 'Falls Church, Virginia, US'],
+    ['Remote', 'Falls Church, Virginia, US'],
+    ['Remote', 'Dubai, UAE'],
+  ]);
+  assert.doesNotMatch(publicFacts, /Hybrid, Istanbul|Hybrid, Damascus|Turkey \/ Hybrid|Syria \/ Hybrid/);
+  for (const employer of cases.slice(0, 3)) {
+    const overview = chatPassages.find(p => p.id === `${employer.slug}-overview`)!;
+    assert.ok(overview.text.includes(`Remote. Company headquarters: ${employer.headquarters}.`));
+  }
   assert.match(publicFacts, /SILA-4B.*failed acceptance/);
   assert.match(publicFacts, /does not transcribe videos/);
   assert.ok(skills.some(s => s.tools.includes('Claude Code') && s.tools.includes('Codex')));

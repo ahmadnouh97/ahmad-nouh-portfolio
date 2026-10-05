@@ -28,7 +28,7 @@ export const cases = [
   },
   {
     slug: 'ment', name: 'MENT', period: 'Oct 2023 - Oct 2025',
-    role: 'AI Engineer', location: 'Istanbul, Turkey / Hybrid', headquarters: 'Falls Church, Virginia, US',
+    role: 'AI Engineer', location: 'Remote', headquarters: 'Falls Church, Virginia, US',
     category: 'Enrichment & relationship intelligence', title: 'Better context. Less waiting.',
     summary: 'Parallel LLM extraction, clearer profile attribution, relationship graphs, and the services behind a privacy-first network-intelligence platform.',
     stack: ['Python', 'Azure OpenAI', 'Celery', 'Neo4j', 'n8n', 'MCP', 'RabbitMQ', 'Grafana'],
@@ -43,7 +43,7 @@ export const cases = [
   },
   {
     slug: 'lableb', name: 'Lableb', period: 'Aug 2020 - Sep 2023',
-    role: 'AI Engineer', location: 'Damascus, Syria / Hybrid', headquarters: 'Dubai, UAE',
+    role: 'AI Engineer', location: 'Remote', headquarters: 'Dubai, UAE',
     category: 'Arabic NLP & service engineering', title: 'Arabic language, practical systems.',
     summary: 'A production spam-classification service alongside Arabic spelling correction, language-model research, and NLP microservices.',
     stack: ['Python', 'TensorFlow', 'Hugging Face', 'KenLM', 'DVC', 'Azure ML', 'Go / Fiber', 'Java / Spring Boot'],
@@ -88,8 +88,8 @@ export const skills = [
 ];
 export const timeline = [
   ['Nov 2025 - Jul 2026', 'Blink', 'AI Engineer / Remote'],
-  ['Oct 2023 - Oct 2025', 'MENT', 'AI Engineer / Hybrid, Istanbul'],
-  ['Aug 2020 - Sep 2023', 'Lableb', 'AI Engineer / Hybrid, Damascus'],
+  ['Oct 2023 - Oct 2025', 'MENT', 'AI Engineer / Remote'],
+  ['Aug 2020 - Sep 2023', 'Lableb', 'AI Engineer / Remote'],
   ['Apr 2020 - Jul 2020', 'Lableb', 'AI Engineer Intern'],
   ['Oct 2018 - Jan 2020', 'Code Experts', 'Web Developer / On-site, Damascus'],
 ];

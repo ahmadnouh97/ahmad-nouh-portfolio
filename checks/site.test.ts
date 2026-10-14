@@ -625,7 +625,7 @@ test('public content stays attributed and excludes private profile details', asy
   assert.match(JSON.stringify(cases[2]), /about 90%/);
   assert.match(JSON.stringify(cases[2]), /DVC/);
   assert.match(JSON.stringify(cases[3]), /hosted Groq/);
-  assert.ok(languages.includes('Turkish - Elementary proficiency'));
+  assert.deepEqual(languages, ['Arabic - Native or bilingual', 'English - Professional working proficiency', 'Turkish - Intermediate']);
   assert.doesNotMatch(publicFacts, /\+90|Limited working|salary|residence.permit|Eyüpsultan|20%/i);
   assert.deepEqual(cases.slice(0, 3).map(c => [c.location, c.headquarters]), [
     ['Remote', 'Falls Church, Virginia, US'],
